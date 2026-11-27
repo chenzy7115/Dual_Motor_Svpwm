@@ -18,10 +18,14 @@
 void M0_setPwm(float Ua, float Ub, float Uc);
 /** @brief 将 M1 三相相电压写入 PWM；输入单位为 V。 */
 void M1_setPwm(float Ua, float Ub, float Uc);
-/** @brief 使能驱动器，并先配置使能引脚为输出。 */
+/** @brief 在 PWM 已初始化为零占空比后使能驱动器；存在安全故障时拒绝使能。 */
 void DFOC_enable();
-/** @brief 禁用驱动器输出。 */
+/** @brief 禁用驱动器、清零六路 PWM，并复位全部控制环和滤波状态。 */
 void DFOC_disable();
+/** @brief 查询安全故障锁存状态。 */
+bool DFOC_isFaulted();
+/** @brief 获取当前安全故障原因；无故障时返回空字符串。 */
+const char* DFOC_faultReason();
 
 // ---------- SVPWM 底层力矩接口 ----------
 /** @brief 用 M0 电角度和 q 轴电压执行 SVPWM；Uq 单位为 V。 */
@@ -34,10 +38,10 @@ void M1_setTorque(float Uq, float angle_el);
 float _normalizeAngle(float angle);
 /** @brief 设置母线电压并初始化 PWM、I²C、编码器和 ADC 电流采样。 */
 void DFOC_Vbus(float power_supply);
-/** @brief 对齐 M0 编码器；参数为磁极对数和方向。 */
-void DFOC_M0_alignSensor(int _PP, int _DIR);
-/** @brief 对齐 M1 编码器；参数为磁极对数和方向。 */
-void DFOC_M1_alignSensor(int _PP, int _DIR);
+/** @brief 对齐 M0 编码器；参数为磁极对数和方向，成功返回 true。 */
+bool DFOC_M0_alignSensor(int _PP, int _DIR);
+/** @brief 对齐 M1 编码器；参数为磁极对数和方向，成功返回 true。 */
+bool DFOC_M1_alignSensor(int _PP, int _DIR);
 /** @brief 获取 M0 归一化电角度，单位 rad。 */
 float S0_electricalAngle();
 /** @brief 获取 M1 归一化电角度，单位 rad。 */
@@ -57,9 +61,9 @@ float DFOC_M0_Velocity();
 /** @brief 获取 M1 滤波后的速度，单位 rad/s。 */
 float DFOC_M1_Velocity();
 /** @brief 获取 M0 累计机械角度，单位 rad。 */
-float DFOC_M0_Angle();
+double DFOC_M0_Angle();
 /** @brief 获取 M1 累计机械角度，单位 rad。 */
-float DFOC_M1_Angle();
+double DFOC_M1_Angle();
 /** @brief 获取 M0 滤波后的 q 轴电流，单位 A。 */
 float DFOC_M0_Current();
 /** @brief 获取 M1 滤波后的 q 轴电流，单位 A。 */
@@ -107,7 +111,7 @@ void DFOC_M0_setTorque(float Target);
 /** @brief M1 电流闭环，目标 q 轴电流单位 A。 */
 void DFOC_M1_setTorque(float Target);
 
-/** @brief 每个控制循环调用一次，更新两路编码器和电流采样。 */
+/** @brief 每个控制循环调用一次，更新编码器、电流采样并执行安全监测。 */
 void runFOC();
 
 #endif

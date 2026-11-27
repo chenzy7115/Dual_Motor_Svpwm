@@ -12,6 +12,14 @@
 
 #define _constrain(amt, low, high) ((amt) < (low) ? (low) : ((amt) > (high) ? (high) : (amt)))
 float voltage_power_supply = dengfoc_config::kPowerSupplyVoltage; //!< 当前母线电压，单位 V
+
+// 安全故障锁存：触发后关闭驱动器并清零 PWM，必须修复故障并重启才能恢复。
+static bool g_safety_fault = false;
+static bool g_pwm_ready = false;
+static const char* g_safety_fault_reason = "";
+static void latchSafetyFault(const char* reason);
+float M0_target = 0.0f;   //!< 当前共享力矩目标，单位 A
+float M1_target = 0.0f;   //!< 源例程保留的 M1 目标变量，当前控制流程未使用
 #define _PI 3.14159265359f       //!< 圆周率 π
 #define _PI_2 1.57079632679f     //!< π/2
 #define _PI_3 1.0471975512f      //!< π/3，SVPWM 每个扇区角度
@@ -32,10 +40,10 @@ LowPassFilter M1_Curr_Flt = LowPassFilter(dengfoc_config::kCurrentFilterTimeCons
 // 每路电机拥有独立的速度环、角度环和电流环。
 PIDController vel_loop_M0 = PIDController(dengfoc_config::kDefaultVelocityP, dengfoc_config::kDefaultVelocityI, dengfoc_config::kDefaultVelocityD, dengfoc_config::kDefaultVelocityRamp, voltage_power_supply / 2);
 PIDController angle_loop_M0 = PIDController(dengfoc_config::kDefaultVelocityP, dengfoc_config::kDefaultVelocityI, dengfoc_config::kDefaultVelocityD, dengfoc_config::kDefaultVelocityRamp, dengfoc_config::kDefaultAngleLimit);
-PIDController current_loop_M0 = PIDController(dengfoc_config::kDefaultCurrentP, dengfoc_config::kDefaultCurrentI, dengfoc_config::kDefaultCurrentD, dengfoc_config::kDefaultCurrentRamp, dengfoc_config::kDefaultCurrentLimit);
+PIDController current_loop_M0 = PIDController(dengfoc_config::kDefaultCurrentP, dengfoc_config::kDefaultCurrentI, dengfoc_config::kDefaultCurrentD, dengfoc_config::kDefaultCurrentRamp, voltage_power_supply * dengfoc_config::kSvpwmLinearModulationRatio);
 PIDController vel_loop_M1 = PIDController(dengfoc_config::kDefaultVelocityP, dengfoc_config::kDefaultVelocityI, dengfoc_config::kDefaultVelocityD, dengfoc_config::kDefaultVelocityRamp, voltage_power_supply / 2);
 PIDController angle_loop_M1 = PIDController(dengfoc_config::kDefaultVelocityP, dengfoc_config::kDefaultVelocityI, dengfoc_config::kDefaultVelocityD, dengfoc_config::kDefaultVelocityRamp, dengfoc_config::kDefaultAngleLimit);
-PIDController current_loop_M1 = PIDController(dengfoc_config::kDefaultCurrentP, dengfoc_config::kDefaultCurrentI, dengfoc_config::kDefaultCurrentD, dengfoc_config::kDefaultCurrentRamp, dengfoc_config::kDefaultCurrentLimit);
+PIDController current_loop_M1 = PIDController(dengfoc_config::kDefaultCurrentP, dengfoc_config::kDefaultCurrentI, dengfoc_config::kDefaultCurrentD, dengfoc_config::kDefaultCurrentRamp, voltage_power_supply * dengfoc_config::kSvpwmLinearModulationRatio);
 // 两路编码器分别绑定独立 I²C 控制器，避免共用总线造成地址/时序冲突。
 Sensor_AS5600 S0 = Sensor_AS5600(0);
 Sensor_AS5600 S1 = Sensor_AS5600(1);
@@ -126,6 +134,14 @@ float _normalizeAngle(float angle) {
  * @note 相电压限制在 0..母线电压，占空比限制在 0..1。
  */
 void M0_setPwm(float Ua, float Ub, float Uc) {
+  // 非有限电压或非法母线电压一律输出零占空比，避免 NaN 转换为整数。
+  if (!isfinite(Ua) || !isfinite(Ub) || !isfinite(Uc) ||
+      !isfinite(voltage_power_supply) || voltage_power_supply <= 0.0f) {
+    ledcWrite(dengfoc_config::kM0PwmPins[0], 0);
+    ledcWrite(dengfoc_config::kM0PwmPins[1], 0);
+    ledcWrite(dengfoc_config::kM0PwmPins[2], 0);
+    return;
+  }
   Ua = _constrain(Ua, 0.0f, voltage_power_supply);
   Ub = _constrain(Ub, 0.0f, voltage_power_supply);
   Uc = _constrain(Uc, 0.0f, voltage_power_supply);
@@ -142,6 +158,13 @@ void M0_setPwm(float Ua, float Ub, float Uc) {
 
 /** @brief 将 M1 三相相电压转换为占空比并写入对应的三个 LEDC 通道。 */
 void M1_setPwm(float Ua, float Ub, float Uc) {
+  if (!isfinite(Ua) || !isfinite(Ub) || !isfinite(Uc) ||
+      !isfinite(voltage_power_supply) || voltage_power_supply <= 0.0f) {
+    ledcWrite(dengfoc_config::kM1PwmPins[0], 0);
+    ledcWrite(dengfoc_config::kM1PwmPins[1], 0);
+    ledcWrite(dengfoc_config::kM1PwmPins[2], 0);
+    return;
+  }
   Ua = _constrain(Ua, 0.0f, voltage_power_supply);
   Ub = _constrain(Ub, 0.0f, voltage_power_supply);
   Uc = _constrain(Uc, 0.0f, voltage_power_supply);
@@ -161,18 +184,28 @@ void M1_setPwm(float Ua, float Ub, float Uc) {
  * @param angle_el 电角度，单位 rad
  */
 void M0_setTorque(float Uq, float angle_el) {
+  if (!isfinite(Uq) || !isfinite(angle_el) ||
+      !isfinite(voltage_power_supply) || voltage_power_supply <= 0.0f) {
+    latchSafetyFault("SVPWM 输入无效");
+    M0_setPwm(0.0f, 0.0f, 0.0f);
+    return;
+  }
+
   // 负电压等效于电角度旋转 180°，随后按正电压计算。
   if (Uq < 0)
     angle_el += _PI;
   Uq = abs(Uq);
+  // 限制在线性调制区，避免 T0 为负导致过调制和谐波增大。
+  Uq = _constrain(Uq, 0.0f, voltage_power_supply * dengfoc_config::kSvpwmLinearModulationRatio);
 
   // 源算法的坐标约定先偏移 π/2，再按每 60° 一个扇区定位。
   angle_el = _normalizeAngle(angle_el + _PI_2);
   int sector = floor(angle_el / _PI_3) + 1;
+  sector = _constrain(sector, 1, 6);
   // 计算相邻两个有效矢量的作用时间 T1/T2，以及零矢量时间 T0。
   float T1 = _SQRT3 * sin(sector * _PI_3 - angle_el) * Uq / voltage_power_supply;
   float T2 = _SQRT3 * sin(angle_el - (sector - 1.0) * _PI_3) * Uq / voltage_power_supply;
-  float T0 = 1 - T1 - T2;
+  float T0 = _constrain(1.0f - T1 - T2, 0.0f, 1.0f);
 
   // 按六个扇区分配零矢量的一半到两侧，得到 A/B/C 相占空比。
   float Ta, Tb, Tc;
@@ -223,16 +256,25 @@ void M0_setTorque(float Uq, float angle_el) {
 
 /** @brief M1 的七段式 SVPWM 实现，计算流程和坐标约定与 M0 完全一致。 */
 void M1_setTorque(float Uq, float angle_el) {
+  if (!isfinite(Uq) || !isfinite(angle_el) ||
+      !isfinite(voltage_power_supply) || voltage_power_supply <= 0.0f) {
+    latchSafetyFault("SVPWM 输入无效");
+    M1_setPwm(0.0f, 0.0f, 0.0f);
+    return;
+  }
+
   if (Uq < 0)
     angle_el += _PI;
   Uq = abs(Uq);
+  Uq = _constrain(Uq, 0.0f, voltage_power_supply * dengfoc_config::kSvpwmLinearModulationRatio);
 
   angle_el = _normalizeAngle(angle_el + _PI_2);
   int sector = floor(angle_el / _PI_3) + 1;
+  sector = _constrain(sector, 1, 6);
   // 计算相邻有效矢量作用时间 T1/T2，以及零矢量时间 T0。
   float T1 = _SQRT3 * sin(sector * _PI_3 - angle_el) * Uq / voltage_power_supply;
   float T2 = _SQRT3 * sin(angle_el - (sector - 1.0) * _PI_3) * Uq / voltage_power_supply;
-  float T0 = 1 - T1 - T2;
+  float T0 = _constrain(1.0f - T1 - T2, 0.0f, 1.0f);
 
   // 按六个扇区分配零矢量的一半到两侧，得到 A/B/C 相占空比。
   float Ta, Tb, Tc;
@@ -281,16 +323,55 @@ void M1_setTorque(float Uq, float angle_el) {
   M1_setPwm(Ua, Ub, Uc);
 }
 
-/** @brief 先配置使能 GPIO 为输出，再写入有效电平，避免上电时引脚状态不确定。 */
+/** @brief 在 PWM 已初始化为零占空比后使能驱动器。 */
 void DFOC_enable() {
+  if (g_safety_fault || !g_pwm_ready) return;
   pinMode(dengfoc_config::kEnablePin, OUTPUT);
+  // 先写无效电平，再拉高有效电平，避免使能边沿前状态不确定。
+  digitalWrite(dengfoc_config::kEnablePin, !dengfoc_config::kEnableActiveLevel);
   digitalWrite(dengfoc_config::kEnablePin, dengfoc_config::kEnableActiveLevel);
 }
 
-/** @brief 将共用使能 GPIO 置为无效电平，关闭两路驱动器输出。 */
+/** @brief 禁用驱动器、清零六路 PWM，并复位全部控制环和滤波状态。 */
 void DFOC_disable() {
   pinMode(dengfoc_config::kEnablePin, OUTPUT);
   digitalWrite(dengfoc_config::kEnablePin, !dengfoc_config::kEnableActiveLevel);
+  M0_setPwm(0.0f, 0.0f, 0.0f);
+  M1_setPwm(0.0f, 0.0f, 0.0f);
+  M0_target = 0.0f;
+  M1_target = 0.0f;
+
+  vel_loop_M0.reset();
+  angle_loop_M0.reset();
+  current_loop_M0.reset();
+  vel_loop_M1.reset();
+  angle_loop_M1.reset();
+  current_loop_M1.reset();
+  M0_Vel_Flt.reset();
+  M1_Vel_Flt.reset();
+  M0_Curr_Flt.reset();
+  M1_Curr_Flt.reset();
+}
+
+/** @brief 查询安全故障锁存状态。 */
+bool DFOC_isFaulted() {
+  return g_safety_fault;
+}
+
+/** @brief 获取当前安全故障原因。 */
+const char* DFOC_faultReason() {
+  return g_safety_fault_reason;
+}
+
+/** @brief 锁存安全故障：目标回零、关闭驱动器并打印一次故障原因。 */
+static void latchSafetyFault(const char* reason) {
+  if (g_safety_fault) return;
+  g_safety_fault = true;
+  g_safety_fault_reason = reason;
+  M0_target = 0.0f;
+  M1_target = 0.0f;
+  DFOC_disable();
+  Serial.printf("安全故障：%s\n", reason);
 }
 
 /**
@@ -299,6 +380,14 @@ void DFOC_disable() {
  * @note 两路电流采样各校准 1000 次，因此初始化会有约 2 s 延时。
  */
 void DFOC_Vbus(float power_supply) {
+  // 初始化期间保持驱动器禁用，所有 PWM 绑定完成并清零后才允许 main 使能。
+  pinMode(dengfoc_config::kEnablePin, OUTPUT);
+  digitalWrite(dengfoc_config::kEnablePin, !dengfoc_config::kEnableActiveLevel);
+
+  if (!isfinite(power_supply) || power_supply <= 0.0f) {
+    latchSafetyFault("母线电压参数无效");
+    return;
+  }
   voltage_power_supply = power_supply;
   pinMode(dengfoc_config::kM0PwmPins[0], OUTPUT);
   pinMode(dengfoc_config::kM0PwmPins[1], OUTPUT);
@@ -312,23 +401,35 @@ void DFOC_Vbus(float power_supply) {
     ledcAttachChannel(dengfoc_config::kM0PwmPins[i], dengfoc_config::kPwmFrequencyHz, dengfoc_config::kPwmResolutionBits, dengfoc_config::kM0PwmChannels[i]);
     ledcAttachChannel(dengfoc_config::kM1PwmPins[i], dengfoc_config::kPwmFrequencyHz, dengfoc_config::kPwmResolutionBits, dengfoc_config::kM1PwmChannels[i]);
   }
+  // 明确输出零占空比，随后才允许使能驱动器。
+  M0_setPwm(0.0f, 0.0f, 0.0f);
+  M1_setPwm(0.0f, 0.0f, 0.0f);
+  g_pwm_ready = true;
   Serial.println("完成PWM初始化设置");
-  pinMode(dengfoc_config::kEnablePin, OUTPUT);
 
-  // 使用两个独立 I²C 总线初始化两路 AS5600。
+  // 固定 ADC 衰减，保证 3.3 V 量程假设与模拟读数配置一致。
+  analogSetAttenuation(ADC_11db);
+  analogReadResolution(dengfoc_config::kAdcResolutionBits);
+
+  // 使用两个独立 I²C 总线初始化两路 AS5600，任一路失败都禁止运行。
   S0_I2C.begin(dengfoc_config::kM0I2cSdaPin, dengfoc_config::kM0I2cSclPin, dengfoc_config::kI2cFrequencyHz);
   S1_I2C.begin(dengfoc_config::kM1I2cSdaPin, dengfoc_config::kM1I2cSclPin, dengfoc_config::kI2cFrequencyHz);
-
-  S0.Sensor_init(&S0_I2C);
-  S1.Sensor_init(&S1_I2C);
-
+  const bool encoder0_ok = S0.Sensor_init(&S0_I2C);
+  const bool encoder1_ok = S1.Sensor_init(&S1_I2C);
+  if (!encoder0_ok || !encoder1_ok) {
+    latchSafetyFault("编码器初始化失败");
+    return;
+  }
   Serial.println("编码器加载完毕");
 
-  //两路速度环均使用实际母线电压的一半作为输出限幅。
+  // 速度环限制为母线电压一半，电流环限制在 SVPWM 线性区内。
   vel_loop_M0 = PIDController(dengfoc_config::kDefaultVelocityP, dengfoc_config::kDefaultVelocityI, dengfoc_config::kDefaultVelocityD, dengfoc_config::kDefaultVelocityRamp, voltage_power_supply / 2);
   vel_loop_M1 = PIDController(dengfoc_config::kDefaultVelocityP, dengfoc_config::kDefaultVelocityI, dengfoc_config::kDefaultVelocityD, dengfoc_config::kDefaultVelocityRamp, voltage_power_supply / 2);
-  // 设置 ADC 为 12 位，然后依次校准两路电流采样零偏。
-  analogReadResolution(dengfoc_config::kAdcResolutionBits);
+  const float current_limit = voltage_power_supply * dengfoc_config::kSvpwmLinearModulationRatio;
+  current_loop_M0 = PIDController(dengfoc_config::kDefaultCurrentP, dengfoc_config::kDefaultCurrentI, dengfoc_config::kDefaultCurrentD, dengfoc_config::kDefaultCurrentRamp, current_limit);
+  current_loop_M1 = PIDController(dengfoc_config::kDefaultCurrentP, dengfoc_config::kDefaultCurrentI, dengfoc_config::kDefaultCurrentD, dengfoc_config::kDefaultCurrentRamp, current_limit);
+
+  // PWM 已清零且驱动器仍禁用，可安全完成两路 ADC 零偏校准。
   CS_M0.init();
   CS_M1.init();
 }
@@ -343,42 +444,78 @@ float S1_electricalAngle() {
   return _normalizeAngle((float)(M1_DIR * M1_PP) * S1.getMechanicalAngle() - S1_zero_electric_angle);
 }
 
+/** @brief 检查对齐期间原始相电流是否有限且未超过软件过流阈值。 */
+static bool alignmentCurrentWithinLimit(CurrSense& current_sense) {
+  current_sense.getPhaseCurrents();
+  const float peak_a = fabs(current_sense.current_a);
+  const float peak_b = fabs(current_sense.current_b);
+  const float peak_c = fabs(current_sense.current_c);
+  const float peak = peak_a > peak_b ? peak_a : peak_b;
+  const float overall_peak = peak > peak_c ? peak : peak_c;
+  return isfinite(overall_peak) && overall_peak <= dengfoc_config::kOverCurrentThresholdA;
+}
+
 /**
  * @brief 施加固定方向力矩使 M0 转子对齐，再记录零电角度。
  * @param _PP 电机磁极对数
  * @param _DIR 电机/编码器方向，1 或 -1
+ * @return 编码器通信和对齐电流均正常时返回 true
  */
-void DFOC_M0_alignSensor(int _PP, int _DIR) {
+bool DFOC_M0_alignSensor(int _PP, int _DIR) {
+  if (g_safety_fault || !S0.isHealthy() || _PP <= 0 || (_DIR != 1 && _DIR != -1)) {
+    latchSafetyFault("M0 对齐参数或编码器异常");
+    return false;
+  }
   M0_PP = _PP;
   M0_DIR = _DIR;
-  M0_setTorque(dengfoc_config::kAlignVoltage, _3PI_2);  //起劲
+  const double angle_before = S0.getAngle();
+  M0_setTorque(dengfoc_config::kAlignVoltage, _3PI_2);
   delay(dengfoc_config::kAlignSettleTimeMs);
   S0.Sensor_update();
+  const double movement = fabs(S0.getAngle() - angle_before);
+  if (!S0.isHealthy() || !alignmentCurrentWithinLimit(CS_M0) ||
+      movement > dengfoc_config::kAlignMaxMovementRad) {
+    latchSafetyFault("M0 对齐失败");
+    return false;
+  }
   S0_zero_electric_angle = S0_electricalAngle();
-  M0_setTorque(0, _3PI_2);  //松劲（解除校准）
+  M0_setTorque(0, _3PI_2);
   Serial.print("M0 0电角度：");
   Serial.println(S0_zero_electric_angle);
+  return true;
 }
 
-/** @brief M1 编码器对齐流程：施加 3 V 力矩、等待稳定、记录零电角度后撤去力矩。 */
-void DFOC_M1_alignSensor(int _PP, int _DIR) {
+/** @brief M1 编码器对齐流程：施加力矩、检查通信与电流、记录零电角度后撤去力矩。 */
+bool DFOC_M1_alignSensor(int _PP, int _DIR) {
+  if (g_safety_fault || !S1.isHealthy() || _PP <= 0 || (_DIR != 1 && _DIR != -1)) {
+    latchSafetyFault("M1 对齐参数或编码器异常");
+    return false;
+  }
   M1_PP = _PP;
   M1_DIR = _DIR;
-  M1_setTorque(dengfoc_config::kAlignVoltage, _3PI_2);  //起劲
+  const double angle_before = S1.getAngle();
+  M1_setTorque(dengfoc_config::kAlignVoltage, _3PI_2);
   delay(dengfoc_config::kAlignSettleTimeMs);
   S1.Sensor_update();
+  const double movement = fabs(S1.getAngle() - angle_before);
+  if (!S1.isHealthy() || !alignmentCurrentWithinLimit(CS_M1) ||
+      movement > dengfoc_config::kAlignMaxMovementRad) {
+    latchSafetyFault("M1 对齐失败");
+    return false;
+  }
   S1_zero_electric_angle = S1_electricalAngle();
-  M1_setTorque(0, _3PI_2);  //松劲（解除校准）
+  M1_setTorque(0, _3PI_2);
   Serial.print("M1 0电角度：");
   Serial.println(S1_zero_electric_angle);
+  return true;
 }
 
 /** @brief 获取 M0 按方向修正后的累计机械角度，单位 rad。 */
-float DFOC_M0_Angle() {
+double DFOC_M0_Angle() {
   return M0_DIR * S0.getAngle();
 }
 /** @brief 获取 M1 按方向修正后的累计机械角度，单位 rad。 */
-float DFOC_M1_Angle() {
+double DFOC_M1_Angle() {
   return M1_DIR * S1.getAngle();
 }
 
@@ -430,40 +567,66 @@ float DFOC_M1_Velocity() {
 }
 
 //==============串口接收==============
-float M0_target;   //!< 当前共享力矩目标，单位 A
-float M1_target;   //!< 源例程保留的 M1 目标变量，当前控制流程未使用
-int commaPosition; //!< 换行符在命令字符串中的位置
+static uint32_t g_last_command_ms = 0;   //!< 最近一次有效串口命令时刻
+static bool g_command_received = false;   //!< 是否收到过有效命令
 
 /**
- * @brief 累积串口字符，遇到换行符时解析一个浮点力矩目标。
+ * @brief 使用固定长度缓冲接收换行结尾的浮点力矩命令。
  * @return 本次接收到的完整命令；没有完整命令时返回空字符串
- * @note 源例程只接受单个数值，例如 "0.5\n"，不支持逗号分隔的双电机目标。
+ * @note 只接受单个数值；非法值、NaN、Inf 和超长命令会被拒绝。
  */
 String serialReceiveUserCommand() {
-  static String received_chars;
+  static char buffer[dengfoc_config::kSerialCommandBufferSize];
+  static uint8_t length = 0;
+  static bool dropping = false;
   String command = "";
 
   while (Serial.available()) {
-    char inChar = (char)Serial.read();
-    received_chars += inChar;
+    const char in_char = (char)Serial.read();
+    if (in_char == '\n') {
+      if (!dropping) {
+        buffer[length] = '\0';
+        command = buffer;
 
-    // 换行表示一条命令结束，先保存完整字符串再解析。
-    if (inChar == '\n') {
-      command = received_chars;
-
-      commaPosition = command.indexOf('\n');
-      if (commaPosition != -1) {
-        M0_target = command.substring(0, commaPosition).toDouble();
-        Serial.println(M0_target);
+        char* end = nullptr;
+        const float parsed = strtof(buffer, &end);
+        const bool converted = (end != buffer);
+        if (end != nullptr) {
+          while (*end == ' ' || *end == '\t' || *end == '\r') end++;
+        }
+        if (converted && end != nullptr && *end == '\0' && isfinite(parsed)) {
+          M0_target = _constrain(parsed,
+                                -dengfoc_config::kMaxTargetCurrentA,
+                                 dengfoc_config::kMaxTargetCurrentA);
+          g_last_command_ms = millis();
+          g_command_received = true;
+          Serial.println(M0_target);
+        } else {
+          Serial.println("无效指令");
+        }
       }
-      received_chars = "";
+      length = 0;
+      dropping = false;
+    } else if (!dropping) {
+      if (length < sizeof(buffer) - 1) {
+        buffer[length++] = in_char;
+      } else {
+        // 超长命令直接丢弃到换行，避免固定缓冲溢出和堆分配。
+        dropping = true;
+        length = 0;
+      }
     }
   }
   return command;
 }
 
-/** @brief 返回串口设置的共享电流目标，单位 A。 */
+/** @brief 返回共享电流目标；默认保持到新命令或发送 0，单位 A。 */
 float serial_motor_target() {
+  // 默认关闭超时回零，便于单次输入后持续运行；需要失联保护时可启用。
+  if (dengfoc_config::kSerialCommandTimeoutEnabled && g_command_received &&
+      (uint32_t)(millis() - g_last_command_ms) > dengfoc_config::kSerialCommandTimeoutMs) {
+    M0_target = 0.0f;
+  }
   return M0_target;
 }
 
@@ -516,11 +679,41 @@ void DFOC_M1_set_Force_Angle(float Target)  //力位闭环
   DFOC_M1_setTorque(DFOC_M1_ANGLE_PID((Target - DFOC_M1_Angle()) * 180 / PI));
 }
 
-/** @brief 每个 FOC 循环先更新两路编码器，再读取两路 A/B 相电流。 */
+/** @brief 每个 FOC 循环先更新两路编码器，再读取电流并执行安全监测。 */
 void runFOC() {
   //====传感器更新====
   S0.Sensor_update();
   S1.Sensor_update();
   CS_M0.getPhaseCurrents();
   CS_M1.getPhaseCurrents();
+
+  // 编码器连续读取失败达到阈值后锁存故障，立即封锁 PWM。
+  if (!S0.isHealthy() || !S1.isHealthy()) {
+    latchSafetyFault("编码器通信故障");
+    return;
+  }
+
+  const float peak0a = fabs(CS_M0.current_a);
+  const float peak0b = fabs(CS_M0.current_b);
+  const float peak1a = fabs(CS_M1.current_a);
+  const float peak1b = fabs(CS_M1.current_b);
+  const float peak01 = peak0a > peak0b ? peak0a : peak0b;
+  const float peak10 = peak1a > peak1b ? peak1a : peak1b;
+  const float peak = peak01 > peak10 ? peak01 : peak10;
+
+  if (!isfinite(peak)) {
+    latchSafetyFault("电流采样异常");
+    return;
+  }
+
+  // 连续多个控制周期超过阈值才动作，过滤 ADC 瞬时尖峰。
+  static uint8_t overcurrent_cycles = 0;
+  if (peak > dengfoc_config::kOverCurrentThresholdA) {
+    if (overcurrent_cycles < dengfoc_config::kOverCurrentDebounceCycles) overcurrent_cycles++;
+    if (overcurrent_cycles >= dengfoc_config::kOverCurrentDebounceCycles) {
+      latchSafetyFault("软件过流保护");
+    }
+  } else {
+    overcurrent_cycles = 0;
+  }
 }

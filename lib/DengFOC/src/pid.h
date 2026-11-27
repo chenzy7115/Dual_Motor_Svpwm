@@ -26,6 +26,9 @@ public:
      */
     float operator() (float error);
 
+    /** @brief 清零误差历史、积分、输出和时间戳，用于故障恢复或模式切换。 */
+    void reset();
+
     float P; //!< 比例增益(P环增益)
     float I; //!< 积分增益（I环增益）
     float D; //!< 微分增益（D环增益）

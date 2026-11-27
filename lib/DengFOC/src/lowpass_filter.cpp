@@ -4,12 +4,18 @@
 
 /** @brief 保存时间常数，将上次输出和时间戳初始化为零/当前时刻。 */
 LowPassFilter::LowPassFilter(float time_constant)
-    : Tf(time_constant)
+    : Tf(time_constant > 0.0f ? time_constant : 1e-3f)
     , y_prev(0.0f)
 {
     timestamp_prev = micros();
 }
 
+
+/** @brief 重置滤波输出和时间戳。 */
+void LowPassFilter::reset(float initial_value){
+    y_prev = isfinite(initial_value) ? initial_value : 0.0f;
+    timestamp_prev = micros();
+}
 
 /**
  * @brief 根据实际采样间隔执行一阶低通滤波。
@@ -18,6 +24,11 @@ LowPassFilter::LowPassFilter(float time_constant)
  */
 float LowPassFilter::operator() (float x)
 {
+    if (!isfinite(x)) {
+        reset();
+        return 0.0f;
+    }
+
     // 计算距上次调用的时间，单位由 us 转换为 s。
     unsigned long timestamp = micros();
     float dt = (timestamp - timestamp_prev)*1e-6f;

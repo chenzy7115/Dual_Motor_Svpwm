@@ -27,6 +27,8 @@ public:
      * @return 低通滤波后的输出值
      */
     float operator() (float x);
+    /** @brief 重置滤波历史；可选指定新的初始输出。 */
+    void reset(float initial_value = 0.0f);
     float Tf; //!< 低通滤波时间常数，单位 s
 
 protected:
